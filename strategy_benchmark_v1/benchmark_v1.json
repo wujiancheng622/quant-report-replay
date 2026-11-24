@@ -1,0 +1,27 @@
+{
+  "version": "V1",
+  "frozen_on": "2026-11-19",
+  "revision": "V1-R5-20261119",
+  "revision_note": "移除历史最高点恢复时间硬性上限；仅按扣费净年化与最大回撤连续标准判PASS/FAIL；恢复期只报告，PASS后人工复核。",
+  "type": "independent_strategy",
+  "anchors": [
+    {"drawdown": 0.10, "min_cagr": 0.06, "label": "低风险"},
+    {"drawdown": 0.18, "min_cagr": 0.10, "label": "稳健"},
+    {"drawdown": 0.25, "min_cagr": 0.15, "label": "均衡"},
+    {"drawdown": 0.35, "min_cagr": 0.20, "label": "进取"}
+  ],
+  "interpolation": "linear_between_anchors; flat_6_percent_below_10_percent_dd",
+  "over_35_percent_drawdown": "fail",
+  "recovery_duration": "report_only; neither an independent gate nor an input to PASS/FAIL; manually review after PASS",
+  "post_pass_review": "HUMAN_REVIEW",
+  "preferred_history_years": 10,
+  "minimum_actual_years_without_proxy": 6,
+  "proxy": "UPSTREAM_VALIDATED_ACCEPT_AS_IS; optional metadata only; never reassess accuracy or require follow-up",
+  "history_selection": "prefer_longest_available_upstream_approved_continuous_equity_history_including_proxies",
+  "submission_contract": "single_official_main_run_only; one_ledger; cost_scenario_NORMAL; no_variant_selection_or_stress_testing",
+  "costs": "qmt_gate live broker fee rules with disclosed slippage",
+  "stability": "monthly rolling 3-year profit ratio >=70% stable, >=50% moderate, else weak; not a hard gate",
+  "input_contract": "source strategy backtest and proxies are validated upstream; this skill only validates dates and NAV format then applies numerical V1 gates",
+  "combination": false,
+  "relative_to_v12_or_m2": "reference_only"
+}
