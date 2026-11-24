@@ -36,12 +36,13 @@ from account_checks import AccountMismatch, reconcile_account
 from market_calendar import TUSHARE_CLIENT, mainland_sessions, refresh_calendar
 from simulation_gate import POLICY as SIMULATION_POLICY, decide as decide_simulation
 import pipeline_mail
-from prompts import AUDIT, EVIDENCE_REVIEW, RESEARCH, RESEARCH_RESUME
+import tushare_probe
+from prompts import AUDIT, RESEARCH, RESEARCH_RESUME, RESEARCH_TOOL_GUIDE
 from v1_handoff import (
-    DataPending, atomic_text, check_replay_seal, check_research_freeze, check_rule_contract, declared_proxy_use, digest,
+    DataPending, TEMPORARY_DATA, atomic_text, check_replay_seal, check_research_freeze, check_rule_contract, declared_proxy_use, digest,
     expected_sessions, history_problem, inside,
     planned_history_problem, proxy_approval, proxy_receipts, read_json, save_json, validate_rule_gap,
-    validate_short_history,
+    select_scoring_book, validate_short_history,
 )
 
 
@@ -66,8 +67,9 @@ RESEARCH_EFFORT = 'high'
 AUDIT_MODEL = 'gpt-6.2-sol'
 AUDIT_EFFORT = 'max'
 AUDIT_CONTEXT_WINDOW = 872_000
-DEFAULT_WORKERS = 5
+DEFAULT_WORKERS = 10
 DATA_RETRY_DELAY = 900
+TUSHARE_RETRY_LOCK = Lock()
 SUMMARY_LOCK = Lock()
 MAIL_LOCK = Lock()
 WSL_DISTRO = 'Ubuntu-24.04'
@@ -78,7 +80,7 @@ RESEARCH_STOPS = {'rules_missing': 'rules', 'rules_pending': 'rules',
                   'history_short': 'data', 'data_pending': 'data', 'evidence_missing': 'data',
                   'source_pending':'rules','invalid_replay': 'screen'}
 END_STATES = ('blocked', 'run_failed', 'diagnostic', 'v1_diagnostic_fail', 'v1_pending_evidence','market_pending',
-              'v1_fail', 'audit_hold', 'audit_rejected', 'audit_uncertain', 'passed', 'previous',
+              'v1_fail', 'v1_fail_review', 'audit_hold', 'audit_rejected', 'audit_uncertain', 'passed', 'previous',
               'scope_excluded', *RESEARCH_STOPS)
 QUEUE_IDLE = (*END_STATES, 'awaiting_execution')
 RULE_IDS = {f'QG-{i:02}' for i in range(1, 23)}
@@ -255,7 +257,7 @@ def research_run_id(row):
 def enqueue_retest(db, sha, reason, brief):
     row = db.execute('select * from queue where sha=?', (sha,)).fetchone()
     if row is None or row['status'] not in ('blocked', 'run_failed', 'diagnostic', 'audit_uncertain','audit_rejected',
-                                          'previous', 'v1_fail', 'v1_diagnostic_fail', 'v1_pending_evidence','market_pending',
+                                          'previous', 'v1_fail', 'v1_fail_review', 'v1_diagnostic_fail', 'v1_pending_evidence','market_pending',
                                           *RESEARCH_STOPS):
         raise ValueError('重开所选任务需要已有结案记录')
     return reopen_research(db,row,reason,brief.read_text(encoding='utf-8-sig') if brief else '')
@@ -371,8 +373,6 @@ def v1_batch_progress(rows):
                 result = read_json(result_file)
                 if result.get('run_role')!='OFFICIAL_MAIN' or result.get('cost_scenario')!='NORMAL':
                     continue
-                if not (historical_job/'account_validation.json').is_file():
-                    raise ValueError('缺正式核账回执')
                 submission = inside(historical_job,'official_submission.json')
                 manifest = read_json(submission)
                 ledger = inside(historical_job,manifest['ledger_path'])
@@ -380,6 +380,8 @@ def v1_batch_progress(rows):
                     raise ValueError('非有限成绩')
                 if result.get('inputs')!=official_inputs(historical_job,submission,ledger):
                     raise ValueError('成绩与输入不匹配')
+                if 'quality_sha256' not in manifest and 'account_sha256' not in result['inputs']:
+                    raise ValueError('旧正式成绩缺核账回执')
                 if row is not None and row['retest']==item['retest'] and row['v1']!=result.get('screening_status'):
                     raise ValueError('当前队列成绩与文件不匹配')
                 grade = result.get('screening_status')
@@ -389,7 +391,7 @@ def v1_batch_progress(rows):
             passed += grade=='PASS'
             failed += grade=='FAIL'
     return ['## 51 份重跑的 V1 统计', '',
-            f'本轮已结案 {done}/{len(batch)} 份，已核正式 V1 {passed+failed} 份（PASS {passed}、FAIL {failed}），旧成绩待核 {unverified} 份。', '']
+            f'本轮已结案 {done}/{len(batch)} 份，已核正式 V1 {passed+failed} 份（PASS {passed}、FAIL {failed}），成绩指纹待核 {unverified} 份。', '']
 
 
 def summarize(db):
@@ -428,6 +430,7 @@ def write_summary(db):
     rows = db.execute('select * from queue order by arrived, sha').fetchall()
     excluded = scope_exclusions()
     done = [r for r in rows if r['status'] in END_STATES]
+    fail_review = sum(r['status']=='v1_fail_review' for r in rows)
     today = local_now().date().isoformat()
     statuses = {
         'queued':'待处理','prepare':'核查规则和数据','replay':'复现回测','benchmark':'待 V1',
@@ -440,7 +443,8 @@ def write_summary(db):
         'invalid_replay':'已确认回放有错误','v1_diagnostic_fail':'V1 参考分不达标',
         'v1_pending_evidence':'V1 账本待补证','evidence_review':'同会话补证',
         'audit':'独立初审','mail':'通过，处理邮件','blocked':'证据不足','diagnostic':'诊断已回放',
-        'v1_fail':'V1 未通过','audit_hold':'关键证据待核','audit_rejected':'已证实严重问题',
+        'v1_fail':'V1 未通过','v1_fail_review':'V1 FAIL，关键证据待复核',
+        'audit_hold':'关键证据待核','audit_rejected':'已证实严重问题',
         'audit_uncertain':'审计不确定','passed':'可安排模拟观察','scope_excluded':'范围外',
         'previous':'已有研究记录','fault':'运行异常，待重试',
         'run_failed':'运行异常，研究未完成',
@@ -454,6 +458,8 @@ def write_summary(db):
     if outside_count:
         pending = sum(r['sha'] not in excluded and r['status'] not in END_STATES for r in rows)
         lines[5:5] = [f'当前范围外 {outside_count} 份，范围内待完成 {pending} 份。','']
+    if fail_review:
+        lines[5:5] = [f'V1 FAIL 且证据待复核 {fail_review} 份，仍保留在复核清单。','']
     today_pass = [r for r in rows if r['status']=='passed' and str(r['updated']).startswith(today)]
     if not today_pass:
         lines.append('今日暂无通过正式 V1 和模拟观察准入的候选。')
@@ -466,7 +472,7 @@ def write_summary(db):
         links = [f'[{label}](<{(work/file).as_posix()}>)' for label,file in
                  [('规则证据','evidence.md'),('回测','replay.md'),('送检补证','evidence_review.md'),('V1 正式评分',v1_file),
                   ('V1 数值诊断','v1_diagnostic.json'),('原市场复核','market_scope_review.json'),
-                  ('独立核账','account_validation.json'),('初审','audit.md'),
+                  ('独立核账','account_validation.json'),('V1 证据状态','v1_quality.json'),('初审','audit.md'),
                   ('模拟准入','simulation_decision.json'),('准入补核','simulation_review.md'),
                   ('原文策略分支','strategy_branches.json'),('规则缺口','rule_gap.json')]
                  if (work/file).is_file() and not (row['status']=='market_pending' and file=='v1_diagnostic.json')]
@@ -603,6 +609,9 @@ def model_run(job, phase, instruction, model, audit=False, source_only=False):
                             f'宿主机技能目录：{wsl_path(SKILLS)}。'
                             '正式清单所有证据路径使用相对当前研究目录的路径，便于 Windows 端接续。'
                             '仅通过行情客户端访问已授权 Tushare 或可读缓存，严禁在输出中写入凭据。')
+            instruction += RESEARCH_TOOL_GUIDE.format(
+                tools=shlex.join([WSL_PYTHON,'-B',wsl_path(HERE/'research_tools.py')]),
+                probe=shlex.join([WSL_PYTHON,'-B',wsl_path(HERE/'tushare_probe.py')]))
         effort = AUDIT_EFFORT if audit else RESEARCH_EFFORT
         command += ['exec','--skip-git-repo-check',
                    '--disable','memories','--disable','apps','-c','approval_policy="never"',
@@ -744,39 +753,48 @@ def audit_code_dependencies(job, sealed, manifest):
 
 def extract_audit_packet(job, ledger, audit_dir=None):
     audit_dir = audit_dir or job
+    quality_path = job/'v1_quality.json'
+    book = ledger.parent if quality_path.is_file() else job
     skipped = []
     try:
-        file_names = read_json(inside(job,'audit_inputs.json'))
+        file_names = read_json(inside(book,'audit_inputs.json'))
         if not isinstance(file_names,list):
             raise ValueError('格式应为文件路径数组')
     except (OSError,ValueError):
         file_names = []
         skipped.append(dict(name='audit_inputs.json',reason='无可用附加目录，尝试用已冻结证据审计'))
-    allow = [(job/'source.txt','原文逐页文本',True),(job/'protocol.json','冻结协议',True),
+    allow = [(job/'source.txt','原文逐页文本',True),(book/'protocol.json','冻结协议',True),
              (ledger,'逐日净值账本',True)]
-    proof = audit_dir/'account_validation.json'
+    if quality_path.is_file():
+        allow.append((quality_path,'评分时已记录的证据状态和待核事实',True))
+    proof = book/'account_validation.json' if audit_dir==job else audit_dir/'account_validation.json'
     if proof.is_file():
         allow.append((proof,'独立核账回执',True))
     if (job/'source_extract.json').is_file():
         allow.append((job/'source_extract.json','PDF 提取覆盖回执',True))
     if (audit_dir/'cash_evidence.json').is_file():
         allow.append((audit_dir/'cash_evidence.json','补审现金权益结构化核验依据',True))
-    sealed = job/'replay_seal.json'
+    sealed = book/'replay_seal.json'
     if sealed.is_file():
-        manifest = read_json(inside(job,'replay_inputs.json'))
-        for path in audit_code_dependencies(job,read_json(sealed)['files'],manifest):
+        manifest = read_json(inside(book,'replay_inputs.json'))
+        for path in audit_code_dependencies(book,read_json(sealed)['files'],manifest):
             allow.append((path,'冻结回放代码或必要依赖',True))
         # Use the exact coefficient source pinned by the actual replay, not a same-named fitting note.
         for name in read_json(sealed)['files']:
             if Path(name).name.lower().endswith('_fit_lock.json'):
-                allow.append((inside(job,name),'回放实际使用的拟合锁',True))
-    if (job/'account_evidence.json').is_file():
-        accounts = read_json(job/'account_evidence.json')
-        for key in ('fee_schedule','events','fills'):
-            if isinstance(accounts.get(key),str):
-                path = inside(job,accounts[key])
-                if path not in {item[0] for item in allow}:
-                    allow.append((path,f'独立核账使用的 {key}',True))
+                allow.append((inside(book,name),'回放实际使用的拟合锁',True))
+    if (book/'account_evidence.json').is_file():
+        try:
+            accounts = read_json(book/'account_evidence.json')
+            if not isinstance(accounts,dict):
+                raise ValueError('核账清单格式无效')
+            for key in ('fee_schedule','events','fills'):
+                if isinstance(accounts.get(key),str):
+                    path = inside(book,accounts[key])
+                    if path not in {item[0] for item in allow}:
+                        allow.append((path,f'核账使用的 {key}',proof.is_file()))
+        except (OSError,ValueError) as exc:
+            skipped.append(dict(name='account_evidence.json',reason=safe_text(exc)))
     for path in (SKILLS/'quant-overfit-gate/SKILL.md', SKILLS/'quant-overfit-audit/references/rules-core.md',
                  SKILLS/'bayesian-quant-thinking/SKILL.md'):
         allow.append((path,path.parent.name+'/'+path.name,True))
@@ -786,7 +804,7 @@ def extract_audit_packet(job, ledger, audit_dir=None):
             skipped.append(dict(name=safe_text(name),reason='说明文档或非原始证据类型'))
             continue
         try:
-            path = inside(job,name)
+            path = inside(book,name)
         except ValueError:
             skipped.append(dict(name=name,reason='文件缺失或超出目录'))
             continue
@@ -1072,6 +1090,9 @@ def evaluate_verified(job, submission, result_path):
     if proposal.get('initial_date') is not None:
         proposal['initial_date'] = pd.Timestamp(str(proposal['initial_date'])).date().isoformat()
     seed = benchmark_seed(dates[0],nav[0],proposal['initial_capital'],proposal.get('initial_date'))
+    evidence_status = None
+    if 'quality_sha256' in manifest:
+        evidence_status = 'pending' if read_json(job/'v1_quality.json')['key_gaps'] else 'clear'
     if official_inputs(job,submission,ledger)!=inputs:
         raise ValueError('读取正式账本期间输入发生变化')
     if not result_path.exists():
@@ -1085,13 +1106,22 @@ def evaluate_verified(job, submission, result_path):
         validate_benchmark_result(result,seed,dates[-1])
         if official_inputs(job,submission,ledger)!=inputs:
             raise ValueError('正式评分期间账本、证据或 V1 版本发生变化')
+        if evidence_status is not None:
+            book = ledger.parent
+            protocol = read_json(inside(book,'protocol.json'))
+            check_research_freeze(book,protocol['strategy_id'])
+            check_replay_seal(book,protocol)
         result.update(source=str(ledger),inputs=inputs)
+        if evidence_status is not None:
+            result['evidence_status'] = evidence_status
         save_json(result_path,result)
         staged.unlink()
     result = read_json(result_path)
     validate_benchmark_result(result,seed,dates[-1])
     if result.get('inputs')!=inputs:
         raise ValueError('正式成绩与当前账本、核账、清单或评分版本不匹配，不能沿用旧分')
+    if evidence_status is not None and result.get('evidence_status')!=evidence_status:
+        raise ValueError('成绩记录与评分时的证据状态不一致')
     if (result.get('run_role')!='OFFICIAL_MAIN' or result.get('cost_scenario')!='NORMAL'
             or result.get('screening_status') not in ('PASS','FAIL')):
         raise ValueError('正式 V1 成绩的角色或状态无效')
@@ -1099,12 +1129,36 @@ def evaluate_verified(job, submission, result_path):
 
 
 def official_inputs(job, submission, ledger):
+    manifest = read_json(submission)
     inputs = dict(ledger_sha256=digest(ledger), submission_sha256=digest(submission),
                   rules_sha256=digest(BENCHMARK.with_name('benchmark_v1.json')),
                   evaluator_sha256=digest(BENCHMARK))
     proof = job/'account_validation.json'
-    if proof.is_file():
+    if 'quality_sha256' in manifest:
+        quality_path = inside(job,'v1_quality.json')
+        if digest(quality_path) != manifest['quality_sha256']:
+            raise ValueError('评分后证据状态凭证发生变化')
+        quality = read_json(quality_path)
+        book = ledger.parent
+        if (quality['ledger_sha256'] != inputs['ledger_sha256']
+                or quality['protocol_sha256'] != digest(inside(book,'protocol.json'))
+                or quality['freeze_sha256'] != digest(inside(book,'freeze_receipt.json'))
+                or quality['replay_seal_sha256'] != digest(inside(book,'replay_seal.json'))):
+            raise ValueError('评分账本或封存规则与评分交接不匹配')
+        if quality['revision'] and digest(inside(job,quality['revision']['path'])) != quality['revision']['sha256']:
+            raise ValueError('评分后修正版交接凭证发生变化')
+        inputs['quality_sha256'] = manifest['quality_sha256']
+        if quality['account_status']=='verified':
+            proof = inside(book,'account_validation.json')
+        else:
+            proof = None
+    if proof is not None and proof.is_file():
         inputs['account_sha256'] = digest(proof)
+    admission = manifest.get('admission_sha256')
+    if admission is not None:
+        if digest(inside(job,'submission_evidence.json')) != admission:
+            raise ValueError('正式成绩的送检证据发生变化')
+        inputs['admission_sha256'] = admission
     return inputs
 
 
@@ -1168,56 +1222,103 @@ def verify_account(job, protocol, ledger, manifest):
 def assert_scored_book(job, submission, ledger, score):
     if official_inputs(job,submission,ledger)!=score['inputs']:
         raise ValueError('评分后核账、主账本或规则发生变化，暂停审计结论')
-    proof = read_json(inside(job,'account_validation.json'))
-    accounts = read_json(inside(job,'account_evidence.json'))
+    book = job
+    if 'quality_sha256' in score['inputs']:
+        book = ledger.parent
+        protocol = read_json(inside(book,'protocol.json'))
+        check_research_freeze(book,protocol['strategy_id'])
+        check_replay_seal(book,protocol)
+        if 'account_sha256' not in score['inputs']:
+            return
+    proof = read_json(inside(book,'account_validation.json'))
+    accounts = read_json(inside(book,'account_evidence.json'))
     if (proof['ledger_sha256']!=score['inputs']['ledger_sha256']
-            or any(digest(inside(job,accounts[key]))!=token for key,token in proof['book_files'].items())
-            or any(digest(inside(job,name))!=token for name,token in proof['inputs']['files'].items())
-            or digest(inside(job,'protocol.json'))!=proof['inputs']['protocol_sha256']):
+            or any(digest(inside(book,accounts[key]))!=token for key,token in proof['book_files'].items())
+            or any(digest(inside(book,name))!=token for name,token in proof['inputs']['files'].items())
+            or digest(inside(book,'protocol.json'))!=proof['inputs']['protocol_sha256']):
         raise ValueError('评分后账务流水、冻结协议或输入证据已变化')
-
-
-def evaluate_diagnostic(job, protocol):
-    """Score a full frozen diagnostic ledger using V1's direct numeric entry."""
-    plan = protocol['v1_preflight']
-    ledger,equity,dates = full_research_ledger(job,protocol)
-    first,last = dates[0],dates[-1]
-    seed = benchmark_seed(first,equity.iloc[0],plan['initial_capital'])
-    if history_problem(first,last):
-        raise ValueError('数值诊断需要完整的冻结长账本')
-    result_path = job/'v1_diagnostic.json'
-    inputs = dict(ledger_sha256=digest(ledger), protocol_sha256=digest(inside(job,'protocol.json')),
-                  rules_sha256=digest(BENCHMARK.with_name('benchmark_v1.json')),
-                  evaluator_sha256=digest(BENCHMARK))
-    if result_path.is_file():
-        previous = read_json(result_path)
-        if previous.get('run_role')=='DIAGNOSTIC_ONLY' and previous.get('inputs')==inputs:
-            validate_benchmark_result(previous,seed,last)
-            return previous
-        if (job/'evidence_review.jsonl').is_file():
-            raise ValueError('补证期间 V1 诊断输入发生变化，保留原分数并暂停送检')
-    with tempfile.TemporaryDirectory(prefix='v1-diagnostic-',dir=job) as folder:
-        normalized = Path(folder)/'ledger.csv'
-        output = Path(folder)/'result.json'
-        pd.DataFrame({'date':dates.strftime('%Y-%m-%d'),'nav':equity.to_numpy()
-                      }).to_csv(normalized,index=False)
-        command = [sys.executable,str(BENCHMARK),'--input',str(normalized),
-                   '--name',protocol['strategy_version'],'--capital',str(plan['initial_capital']),
-                   '--output',str(output)]
-        if plan['proxy_used']:
-            command.append('--proxy-used')
-        subprocess.run(command,capture_output=True,check=True,creationflags=subprocess.CREATE_NO_WINDOW)
-        result = read_json(output)
-    validate_benchmark_result(result,seed,last)
-    if result.get('run_role')!='DIAGNOSTIC_ONLY' or result.get('screening_status') not in ('PASS','FAIL'):
-        raise ValueError('V1 数值诊断返回了无效结果')
-    result.update(source=str(ledger),inputs=inputs)
-    save_json(result_path,result)
-    return result
 
 
 def verified_proxy_receipts(job, protocol):
     return proxy_receipts(proxy_approval(protocol),lambda name: inside(job,name),digest)
+
+
+def has_scoring_artifacts(job):
+    if not (job/'freeze_receipt.json').is_file():
+        return False
+    if any((job/name).is_file() for name in ('v1_ledger_revision.json','compatible_replay_receipt.json',
+                                             'compatible_replay_pointer.json')):
+        return True
+    plan = read_json(inside(job,'protocol.json')).get('v1_preflight',{})
+    name = plan.get('ledger_path')
+    return isinstance(name,str) and bool(name) and (job/name).is_file()
+
+
+def read_retry_probe(job, relative, request):
+    receipt = read_json(inside(job,relative))
+    if (receipt.get('provider')!='Tushare' or receipt.get('request')!=request
+            or receipt.get('receipt')!=relative):
+        raise ValueError('自动取数回执与重放请求不一致')
+    if receipt.get('status') in ('ok','empty') and digest(inside(job,receipt['data']))!=receipt['sha256']:
+        raise ValueError('自动取数回执对应的数据指纹已变化')
+    return receipt
+
+
+def replay_data_request(job):
+    entry = tushare_probe.pending_request(job)
+    if entry is None:
+        return None
+    request,source = entry
+    api = request['api']
+    pointer = job/'data_retry_probe.json'
+    last = None
+    if pointer.is_file():
+        previous = read_json(pointer)
+        relative = previous.get('receipt')
+        if (previous.get('source')==source and previous.get('request')==request
+                and relative and (job/relative).is_file()):
+            last = read_retry_probe(job,relative,request)
+    if last is None or last['status'] in TEMPORARY_DATA:
+        with TUSHARE_RETRY_LOCK:
+            cooldowns = RUNTIME/'tushare_retry_cooldowns.json'
+            waiting = read_json(cooldowns) if cooldowns.is_file() else {}
+            now = time.time()
+            due = waiting.get(api,0)
+            if last is not None:
+                observed = datetime.fromisoformat(last['at']).timestamp()
+                due = max(due,tushare_probe.retry_time(last,observed,DATA_RETRY_DELAY))
+            if due>now:
+                return dict(status='data_pending',reason=f'Tushare {api} 取数退避，等候下一次接口探测',
+                            retry_at=due)
+            relative = f'data_probes/retry-{uuid4().hex}/result.json'
+            target = job/relative
+            target.parent.mkdir(parents=True)
+            save_json(pointer,dict(source=source,request=request,receipt=relative))
+            command = wsl_command(job,WSL_PYTHON,'-B',wsl_path(HERE/'tushare_probe.py'),
+                                  '--api',api,'--params',json.dumps(request['params'],ensure_ascii=False),
+                                  '--fields='+request['fields'],'--receipt',relative)
+            try:
+                with (target.parent/'transport.log').open('wb') as log:
+                    subprocess.run(command,stdout=log,stderr=subprocess.STDOUT,check=True,timeout=45,
+                                   creationflags=subprocess.CREATE_NO_WINDOW)
+                last = read_retry_probe(job,relative,request)
+            except subprocess.TimeoutExpired:
+                due = time.time()+DATA_RETRY_DELAY
+                waiting[api] = due
+                save_json(cooldowns,waiting)
+                return dict(status='data_pending',reason=f'Tushare {api} 自动探测超时，等候下次探测',
+                            retry_at=due)
+            except (subprocess.SubprocessError,OSError,ValueError,KeyError) as exc:
+                return dict(status='data_pending',reason=f'自动取数未完成，见 {target.parent.relative_to(job).as_posix()}/transport.log：{safe_text(exc)}')
+            if last['status'] in TEMPORARY_DATA:
+                due = tushare_probe.retry_time(last,time.time(),DATA_RETRY_DELAY)
+                waiting[api] = due
+                save_json(cooldowns,waiting)
+                return dict(status='data_pending',reason=f'Tushare {api} 仍返回 {last["status"]}，见 {relative}',
+                            retry_at=due)
+    if last['status']=='ok':
+        return dict(status='recovered',receipt=last['receipt'],data=last['data'],rows=last['rows'])
+    return dict(status='data_pending',reason=f'Tushare {api} 返回 {last["status"]}，见 {last["receipt"]}')
 
 
 def research_result(db, row, job, origin):
@@ -1225,6 +1326,12 @@ def research_result(db, row, job, origin):
     legacy = job/'replay_decision.json'
     if legacy.is_file() and not (job/'research.jsonl').is_file() and not (job/'research_decision.json').is_file():
         return read_json(legacy), True
+    retry = job/'data_retry_request.json'
+    probe = None
+    if retry.is_file() and not (job/'data_retry_decision.json').is_file() and not has_scoring_artifacts(job):
+        probe = replay_data_request(job)
+        if probe is not None and probe['status']!='recovered':
+            return probe,False
     try:
         calendar = refresh_calendar(RUNTIME/'market_calendar.json',local_now().date())
     except (RuntimeError,OSError,ValueError,KeyError) as exc:
@@ -1240,19 +1347,23 @@ def research_result(db, row, job, origin):
                f'\n后台取得的沪深交易日历：{wsl_path(calendar)}。'
                f'\n冻结命令（从当前研究目录执行）：{command}\n锁定回放实现和输入：{seal_command}')
     continuation = RESEARCH_RESUME + context
-    retry = job/'data_retry_request.json'
     if not retry.is_file():
         update(db,row['sha'],status='research',detail='同一会话负责核对原文、冻结、回测与补证',candidate=origin['id'])
     summarize(db)
     emit(f'research {row["title"]} 同会话复现、回测和补证')
     if retry.is_file():
         feedback = '\n同一候选的取数暂时失败。仅重试受影响的数据请求，复用已完成产物；缺口仍在就明确落盘。'
+        if probe is not None:
+            feedback = (f'\n程序已用原参数取回 {probe["rows"]} 行数据。回执 {probe["receipt"]}，'
+                        f'原始表 {probe["data"]}。从此回执继续核对可用范围和时点，复用此数据。')
         try:
             out = model_run(job,'data_retry',continuation+feedback,RESEARCH_MODEL)
         except (ModelError,ExecutionPolicyBlocked) as exc:
             return dict(status='data_pending',reason=safe_text(exc)),False
     else:
         out = model_run(job,'research',RESEARCH+context,RESEARCH_MODEL)
+    if has_scoring_artifacts(job):
+        return out,False
     if out['status']=='rules_missing':
         try:
             validate_rule_gap(job)
@@ -1292,27 +1403,95 @@ def research_result(db, row, job, origin):
     return out, False
 
 
-def draft_submission(job, protocol, identifier):
-    check_rule_contract(protocol)
-    draft = read_json(inside(job, 'submission_draft.json'))
+V1_BLOCKING_ISSUES = {
+    'signal_timing': '信号时点或前视数据',
+    'portfolio_inputs': '会改变信号、标的或仓位的核心输入',
+    'execution': '无法核对成交时点、价格或数量',
+    'accounting': '影响现金、持仓、费用、权益或净值的账务缺口',
+}
+
+
+def gather_v1_evidence(job, book, ledger):
+    """Keep factual gaps separate from the single numeric score."""
+    gaps, observations = [], []
+    ledger_hash = digest(ledger)
+    for directory in dict.fromkeys((book,job)):
+        source = directory/'submission_evidence.json'
+        if not source.is_file():
+            continue
+        try:
+            checks = read_json(source)
+            readiness = checks.get('v1_readiness',{})
+            if not isinstance(readiness,dict):
+                raise ValueError('送检证据结构无效')
+            if not readiness and directory!=book:
+                continue
+            if readiness and readiness.get('ledger_sha256') != ledger_hash:
+                if directory==book:
+                    gaps.append(dict(code='handoff',detail='送检说明对应旧账本，需核对当前版本的证据'))
+                continue
+            blockers = readiness.get('blockers',[])
+            if not isinstance(blockers,list):
+                raise ValueError('证据缺口记录必须为数组')
+            for item in blockers[:24]:
+                if (not isinstance(item,dict) or not isinstance(item.get('code'),str)
+                        or item['code'] not in V1_BLOCKING_ISSUES
+                        or not isinstance(item.get('detail'),str) or not item['detail'].strip()):
+                    continue
+                files = []
+                references = item.get('files',[])
+                for rel in references[:8] if isinstance(references,list) else []:
+                    try:
+                        if isinstance(rel,str):
+                            files.append(inside(directory,rel).relative_to(job.resolve()).as_posix())
+                    except (OSError,ValueError):
+                        continue
+                gaps.append(dict(code=item['code'],detail=safe_text(item['detail']),files=files[:8]))
+            notes = readiness.get('observations',[])
+            if isinstance(notes,list):
+                observations.extend(safe_text(note) for note in notes[:24] if isinstance(note,str))
+            timing = checks.get('signal_timing')
+            if not isinstance(timing,list) or not timing:
+                gaps.append(dict(code='signal_timing',detail='缺少可定位的信号时点记录'))
+            else:
+                for rel in timing:
+                    inside(directory,rel)
+            return gaps,observations[:24]
+        except (OSError, ValueError, TypeError, AttributeError) as exc:
+            gaps.append(dict(code='handoff',detail=f'证据目录无法核对：{safe_text(exc)}'))
+    gaps.append(dict(code='handoff',detail='缺少可定位的信号、成交与账务核验材料清单'))
+    return gaps,observations[:24]
+
+
+def prepare_v1(job, book, protocol, ledger, identifier, revision, reported_issue=None):
+    gaps, observations = gather_v1_evidence(job,book,ledger)
     plan = protocol['v1_preflight']
-    fields = ('ledger_path', 'date_column', 'equity_column', 'initial_capital', 'cost_profile', 'proxy_used')
-    if (not isinstance(draft, dict) or draft.get('strategy_id') != protocol['strategy_id']
-            or draft.get('strategy_version') != protocol['strategy_version']
-            or draft.get('run_role') != 'OFFICIAL_MAIN' or draft.get('cost_scenario') != 'NORMAL'
-            or draft.get('index_date', False) is not False or draft.get('initial_date') not in (None, plan['planned_start'])
-            or type(draft.get('proxy_used')) is not bool or any(draft.get(field) != plan[field] for field in fields)):
-        raise ValueError('送检草稿与事前冻结的候选、区间、成本或账本不一致')
-    if plan.get('calendar_path'):
-        checks = read_json(inside(job,'submission_evidence.json'))
-        for kind in ('signal_timing','execution_and_cost','ledger_reconciliation'):
-            paths = checks.get(kind) if isinstance(checks,dict) else None
-            if not isinstance(paths,list) or not paths:
-                raise ValueError(f'正式送检缺少上游核验记录：{kind}')
-            for name in paths:
-                if not isinstance(name,str) or not name.strip() or not inside(job,name).stat().st_size:
-                    raise ValueError(f'正式送检核验文件无效：{kind}')
-    return {**draft, 'strategy_id': identifier}
+    try:
+        verify_account(book,protocol,ledger,plan)
+        account = 'verified'
+    except AccountMismatch:
+        raise
+    except (OSError,ValueError,KeyError,TypeError) as exc:
+        account = 'pending'
+        gaps.append(dict(code='accounting',detail=safe_text(exc)))
+    if reported_issue:
+        gaps.append(dict(code='reported_integrity_issue',
+                         detail=f'研究回报称有账本问题，独立核验未复现该说法：{safe_text(reported_issue)}'))
+    quality = dict(ledger_sha256=digest(ledger),protocol_sha256=digest(book/'protocol.json'),
+                   freeze_sha256=digest(inside(book,'freeze_receipt.json')),
+                   replay_seal_sha256=digest(inside(book,'replay_seal.json')),account_status=account,
+                   key_gaps=gaps,observations=observations, revision=(
+                       dict(path=revision.relative_to(job).as_posix(),sha256=digest(revision)) if revision else None))
+    quality_path = job/'v1_quality.json'
+    save_json(quality_path,quality)
+    fields = ('date_column','equity_column','initial_capital','cost_profile','proxy_used')
+    strategy_type = protocol.get('strategy_type')
+    return dict(strategy_id=identifier,strategy_version=protocol['strategy_version'],
+                strategy_type=strategy_type if isinstance(strategy_type,str) and strategy_type.strip()
+                else 'research_candidate',
+                run_role='OFFICIAL_MAIN',cost_scenario='NORMAL',
+                ledger_path=ledger.relative_to(job.resolve()).as_posix(),
+                quality_sha256=digest(quality_path),**{field:plan[field] for field in fields})
 
 
 def process(db, row):
@@ -1336,15 +1515,24 @@ def process(db, row):
     load_source(job,row)
     origin = catalog_id(db,job,row)
     start_research(origin,run_id,job)
-    out, legacy = research_result(db,row,job,origin)
-    proof = inside(job,'evidence.md')
+    try:
+        out, legacy = research_result(db,row,job,origin)
+    except ModelError as exc:
+        if not has_scoring_artifacts(job):
+            raise
+        out, legacy = dict(status='evidence_missing',reason=safe_text(exc)),False
+    proof = next(p for p in (job/'evidence.md',job/'protocol.json',job/'source.txt') if p.is_file())
     outcome, reason = out['status'], out['reason']
-    if outcome=='scope_excluded':
+    freeze_receipt = job/'freeze_receipt.json'
+    has_book = has_scoring_artifacts(job)
+    if outcome=='scope_excluded' and not has_book:
         state('scope_excluded',reason,candidate=origin['id'])
         return
-    freeze_receipt = job/'freeze_receipt.json'
     retry = job/'data_retry_request.json'
-    if outcome=='data_pending' and out.get('retryable') and not retry.is_file():
+    if outcome=='data_pending' and out.get('retry_at') is not None and not has_book:
+        state('data_retry',reason,candidate=origin['id'],retry_after=out['retry_at'])
+        return
+    if outcome=='data_pending' and out.get('retryable') and not retry.is_file() and not has_book:
         save_json(retry,dict(reason=reason,at=local_now().isoformat(timespec='seconds')))
         state('data_retry',reason,candidate=origin['id'],retry_after=time.time()+DATA_RETRY_DELAY)
         return
@@ -1380,152 +1568,60 @@ def process(db, row):
     checkpoint(identifier,run_id,'rules','pass','已冻结唯一方案',frozen,freeze_receipt)
     checkpoint(identifier,run_id,'data','pass','已实取并核对研究范围；正式资格随账本校验',proof)
     report = job/'replay.md'
-    if (outcome in ('blocked','rules_missing','invalid_replay')
-            or outcome in ('rules_pending','source_pending','history_short','data_pending','evidence_missing') and
-            (legacy or not (job/protocol['v1_preflight']['ledger_path']).is_file())):
-        checkpoint(identifier,run_id,'screen','blocked',reason,report if report.is_file() else proof)
-        state(outcome,reason,candidate=identifier)
-        return
-
-    replay_report = inside(job,'replay.md') if report.is_file() else proof
-    if outcome not in ('diagnostic','official','rules_pending','source_pending','data_pending','evidence_missing','history_short'):
-        raise ValueError('研究会话返回了无效的结案状态')
-    manifest = None
-    if not legacy:
-        try:
-            ledger,_,_ = full_research_ledger(job,protocol)
-        except UnsupportedLedgerMarket as exc:
-            reason = f'{safe_text(exc)}。{reason}'
-            checkpoint(identifier,run_id,'screen','blocked',reason,replay_report)
-            state('market_pending',reason,candidate=identifier)
-            return
-        except (ValueError, KeyError) as exc:
-            status = 'history_short' if outcome=='history_short' else 'evidence_missing'
-            reason = f'{safe_text(exc)}。{reason}'
-            checkpoint(identifier,run_id,'screen','blocked',reason,replay_report)
-            state(status,reason,candidate=identifier)
-            return
-        reconciled = False
-        if (job/'account_evidence.json').is_file():
-            try:
-                verify_account(job,protocol,ledger,protocol['v1_preflight'])
-                reconciled = True
-            except AccountMismatch as exc:
-                reason = safe_text(exc)
-                checkpoint(identifier,run_id,'screen','blocked',reason,replay_report,ledger)
-                state('invalid_replay',reason,candidate=identifier)
-                return
-            except (OSError,ValueError,KeyError,TypeError) as exc:
-                reason = f'{safe_text(exc)}。{reason}'
-        if reconciled and report.is_file() and (job/'submission_draft.json').is_file():
-            try:
-                manifest = draft_submission(job,protocol,identifier)
-            except (OSError,ValueError,KeyError,TypeError) as exc:
-                reason = f'{safe_text(exc)}。{reason}'
-        if manifest is None:
-            result = evaluate_diagnostic(job,protocol)
-            diagnostic = job/'v1_diagnostic.json'
-            evidence = [replay_report,diagnostic]
-            if result['screening_status']=='FAIL':
-                detail = '账务已核，停止追加材料' if reconciled else '账务影响未明，保留待补证'
-                reason = f'V1 参考分未达标，{detail}。{reason}'
-                checkpoint(identifier,run_id,'screen','blocked',reason,*evidence)
-                state('v1_diagnostic_fail' if reconciled else 'v1_pending_evidence',reason,candidate=identifier)
-                return
-            state('evidence_review','V1 参考分达标，回原会话核对正式送检证据',candidate=identifier)
-            try:
-                review = model_run(job,'evidence_review',EVIDENCE_REVIEW+'\n已知缺口：'+reason,RESEARCH_MODEL)
-                evidence.append(inside(job,'evidence_review.md'))
-                if (check_research_freeze(job,origin['id'])!=protocol
-                        or digest(ledger)!=result['inputs']['ledger_sha256']):
-                    raise ValueError('补证期间冻结规则或原评分账本发生变化')
-                reason = review['reason']
-                if review['status']=='invalid_replay':
-                    raise AccountMismatch(reason)
-                if (job/'submission_draft.json').is_file() and report.is_file():
-                    proposed = draft_submission(job,protocol,identifier)
-                    verify_account(job,protocol,ledger,proposed)
-                    manifest = proposed
-            except AccountMismatch as exc:
-                reason = f'已查实账本存在错误，此前参考分不再作为筛选结论：{safe_text(exc)}'
-                checkpoint(identifier,run_id,'screen','blocked',reason,*evidence)
-                state('invalid_replay',reason,candidate=identifier)
-                return
-            except (ModelError,ExecutionPolicyBlocked,OSError,ValueError,KeyError) as exc:
-                reason = safe_text(exc)
-            if manifest is None:
-                reason = f'V1 参考分达标，正式送检仍待补证。{reason}'
-                checkpoint(identifier,run_id,'screen','blocked',reason,*evidence)
-                state('v1_pending_evidence',reason,candidate=identifier)
-                return
-    elif outcome=='diagnostic' or protocol.get('screening_scope')=='diagnostic':
-        checkpoint(identifier,run_id,'screen','blocked',reason,replay_report)
-        state('diagnostic',reason,candidate=identifier)
-        return
-
+    replay_report = report if report.is_file() else proof
     submission = job/'official_submission.json'
-    if legacy:
-        manifest = read_json(inside(job,submission.name))
-        if manifest['strategy_id']!=identifier or manifest['strategy_version']!=protocol['strategy_version']:
-            raise ValueError('送检版本与冻结候选不相符')
-        ledger = inside(job,manifest['ledger_path'])
-        _,dates = ledger_rows(ledger,manifest)
-        reason = history_problem(dates[0],dates[-1])
-        if reason is None:
-            declared = declared_proxy_use(protocol)
-            used = manifest.get('proxy_used',False)
-            if type(used) is not bool or (declared is not None and declared!=used):
-                reason = '送检清单中的代理使用声明与冻结协议不一致'
-            elif used:
-                try:
-                    files = proxy_receipts(proxy_approval(protocol),lambda name: inside(job,name),digest)
-                    recorded = read_json(freeze_receipt).get('proxy_files')
-                    if recorded is not None and recorded!=files:
-                        raise ValueError('冻结后代理核验证据指纹发生变化')
-                except (OSError,ValueError) as exc:
-                    reason = safe_text(exc)
-        if reason:
-            checkpoint(identifier,run_id,'screen','blocked',reason,replay_report,submission)
-            state('diagnostic',reason,candidate=identifier)
-            return
-        previous_plan = {**protocol.get('v1_preflight',{}),**manifest,
-                         'planned_start':dates[0].date().isoformat(),'planned_end':dates[-1].date().isoformat(),
-                         'proxy_used':manifest.get('proxy_used',False)}
-        comparable = {**protocol,'v1_preflight':previous_plan}
-        try:
-            check_rule_contract(protocol)
-            full_research_ledger(job,comparable)
-            verify_account(job,comparable,ledger,manifest)
-        except UnsupportedLedgerMarket as exc:
-            reason = safe_text(exc)
-            checkpoint(identifier,run_id,'screen','blocked',reason,replay_report,ledger)
-            state('market_pending',reason,candidate=identifier)
-            return
-        except AccountMismatch as exc:
-            reason = safe_text(exc)
-            checkpoint(identifier,run_id,'screen','blocked',reason,replay_report,ledger)
-            state('invalid_replay',reason,candidate=identifier)
-            return
-        except (OSError,ValueError,KeyError,TypeError) as exc:
-            result = evaluate_diagnostic(job,comparable)
-            reason = f"旧账本已算 V1 参考分 {result['screening_status']}，正式核账缺证：{safe_text(exc)}"
-            checkpoint(identifier,run_id,'screen','blocked',reason,replay_report,job/'v1_diagnostic.json')
-            state('v1_pending_evidence',reason,candidate=identifier)
-            return
-    else:
-        if submission.is_file() and read_json(submission)!=manifest:
-            raise ValueError('已保存的正式送检清单与当前冻结结果不一致')
-        save_json(submission,manifest)
-    state('benchmark','核验正式账本并运行 V1',candidate=identifier)
     result_path = job/'v1_result.json'
+    revision = None
+    try:
+        if result_path.is_file():
+            manifest = read_json(inside(job,submission.name))
+            ledger = inside(job,manifest['ledger_path'])
+            assert_scored_book(job,submission,ledger,read_json(result_path))
+        else:
+            book,revision = select_scoring_book(job,protocol)
+            if not (book/protocol['v1_preflight']['ledger_path']).is_file():
+                status = outcome if outcome in RESEARCH_STOPS else 'evidence_missing'
+                checkpoint(identifier,run_id,'screen','blocked',reason,replay_report)
+                state(status,reason,candidate=identifier)
+                return
+            check_rule_contract(protocol)
+            inside(book,'replay_seal.json')
+            ledger,_,_ = full_research_ledger(book,protocol)
+            manifest = prepare_v1(job,book,protocol,ledger,identifier,revision,
+                                  reported_issue=reason if outcome=='invalid_replay' and revision is None else None)
+            if (job/'v1_result_verified.json').is_file():
+                raise ValueError('已有历史正式成绩，须新开复验保留原结果')
+            save_json(submission,manifest)
+    except UnsupportedLedgerMarket as exc:
+        checkpoint(identifier,run_id,'screen','blocked',safe_text(exc),replay_report)
+        state('market_pending',safe_text(exc),candidate=identifier)
+        return
+    except AccountMismatch as exc:
+        checkpoint(identifier,run_id,'screen','blocked',safe_text(exc),replay_report)
+        state('invalid_replay',safe_text(exc),candidate=identifier)
+        return
+    except (OSError,ValueError,KeyError,TypeError,AttributeError) as exc:
+        detail = safe_text(exc)
+        checkpoint(identifier,run_id,'screen','blocked',detail,replay_report)
+        state('evidence_missing',detail,candidate=identifier)
+        return
+    state('benchmark','核验正式账本并运行 V1',candidate=identifier)
     v1 = evaluate_verified(job,submission,result_path)
     grade = v1['screening_status']
     scores = dict(v1=grade, net_cagr=v1['cagr'],mdd=v1['mdd'])
     if grade=='FAIL':
-        checkpoint(identifier,run_id,'screen','stop','V1 未通过',result_path)
-        state('v1_fail',f"净年化 {v1['cagr']:.2%}，最大回撤 {v1['mdd']:.2%}",**scores)
-        if identifier == origin['id']:
-            archive(db,row,origin)
+        detail = f"净年化 {v1['cagr']:.2%}，最大回撤 {v1['mdd']:.2%}"
+        if v1.get('evidence_status')=='pending':
+            quality = inside(job,'v1_quality.json')
+            issues = read_json(quality)['key_gaps']
+            detail += '。有可能影响成绩的证据待复核：' + '；'.join(gap['detail'] for gap in issues)
+            checkpoint(identifier,run_id,'screen','blocked',detail,result_path,quality)
+            state('v1_fail_review',detail,**scores)
+        else:
+            checkpoint(identifier,run_id,'screen','stop','V1 未通过',result_path)
+            state('v1_fail',detail,**scores)
+            if identifier == origin['id']:
+                archive(db,row,origin)
         return
     if grade!='PASS':
         raise ValueError('未识别的 V1 判定')
@@ -1565,6 +1661,15 @@ def run_independent_audit(job, submission, ledger, v1, audit_dir):
         audit_path = write_audit_report(audit_dir,uncertain,heading='独立初审 · 不确定')
         return 'audit_uncertain',reason,audit_path,None,'审计不确定'
     simulation = decide_simulation(audit,artifacts)
+    if 'quality_sha256' in v1['inputs']:
+        quality = read_json(inside(job,'v1_quality.json'))
+        # A successful independent recheck in a later audit round can clear accounting gaps.
+        account_cleared = audit_dir!=job and (audit_dir/'account_validation.json').is_file()
+        gaps = [gap for gap in quality['key_gaps'] if gap['code']!='accounting' or not account_cleared]
+        if gaps:
+            simulation['pending'].extend((gap['code'],gap['detail']) for gap in gaps)
+            if simulation['outcome']=='approved':
+                simulation['outcome'] = 'pending'
     decision_path = audit_dir/'simulation_decision.json'
     save_json(decision_path,{**simulation,'v1_ledger_sha256':v1['inputs']['ledger_sha256'],
                              'audit_sha256':digest(inside(audit_dir,'audit_decision.json'))})
@@ -1591,7 +1696,8 @@ def reaudit(db, sha, reason, cash_evidence=None):
     if (score.get('screening_status'),score.get('run_role'),score.get('cost_scenario'))!=('PASS','OFFICIAL_MAIN','NORMAL'):
         raise ValueError('只补审需要同一份有效正式 PASS')
     assert_scored_book(job,submission,ledger,score)
-    protocol = check_research_freeze(job,read_json(inside(job,'protocol.json'))['strategy_id'])
+    book = ledger.parent if 'quality_sha256' in manifest else job
+    protocol = check_research_freeze(book,read_json(inside(book,'protocol.json'))['strategy_id'])
     receipt = dict(score_sha256=digest(score_path),reason=reason,
                    cash_evidence_sha256=digest(cash_evidence) if cash_evidence else None)
     identity = sha256(json.dumps(receipt,sort_keys=True).encode()).hexdigest()[:20]
@@ -1609,7 +1715,7 @@ def reaudit(db, sha, reason, cash_evidence=None):
             raise ValueError('只补审的权益补证材料发生变化')
         cash = read_json(supplement)
     try:
-        checked = reconcile_account(job,protocol,frame,dates,ledger,cash)
+        checked = reconcile_account(book,protocol,frame,dates,ledger,cash)
     except (OSError,ValueError,KeyError,TypeError,AttributeError) as exc:
         detail = safe_text(exc)
         status = 'audit_rejected' if isinstance(exc,AccountMismatch) else 'audit_hold'
@@ -1730,6 +1836,7 @@ def run(watch, source_only=False, workers=None, priority_sha=None):
             if not source_only:
                 emit(f'独立审计上下文：{AUDIT_CONTEXT_WINDOW:,} tokens')
                 emit('正式 V1 已启用后台日历、独立核账和成绩指纹校验')
+                emit('V1 单一路径：完整可信长账本直接评分，证据缺口独立记录')
                 emit(f'已加载模拟观察准入规则 {SIMULATION_POLICY}')
             active = {}
             next_scan = 0.0

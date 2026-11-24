@@ -103,14 +103,7 @@ def smoke(run_live_model):
                 runner.save_json(job/'audit_decision.json',answer)
                 return answer
             if phase=='evidence_review':
-                assert (job/'v1_diagnostic.json').is_file()
-                runner.atomic_text(job/'evidence_review.md','测试补证结果。')
-                if title in ('promoted','late-evidence-error'):
-                    (job/'evidence_draft.json').replace(job/'submission_draft.json')
-                    if title=='late-evidence-error':
-                        return dict(status='invalid_replay',reason='样例确认信号使用了次日输入')
-                    return dict(status='evidence_missing',reason='补证回执的文字与已完成产物不一致')
-                return dict(status='evidence_missing',reason='成交证据尚不足')
+                raise AssertionError('完成账本后应由代码送检')
             assert phase in ('research','coverage_review','rule_gap_review','data_retry') and '--source-id fixture-' in instruction
             runner.atomic_text(job/'evidence.md','测试证据。')
             if title=='missing':
@@ -195,13 +188,20 @@ def smoke(run_live_model):
             if title=='changed-implementation':
                 runner.atomic_text(job/'account.py','# changed after input seal\n')
             if title=='long-diagnostic':
-                return dict(status='diagnostic',reason='十年历史可回放，仍有成交证据待核')
+                (job/'account_evidence.json').unlink()
+                runner.save_json(job/'submission_evidence.json',dict(v1_readiness=dict(
+                    strategy_type='stock',ledger_sha256=runner.digest(job/'ledger.csv'),
+                    blockers=[dict(code='portfolio_inputs',detail='首批信号的历史成员版本未知',
+                                   files=['evidence.md'])],observations=[])))
+                return dict(status='diagnostic',reason='十年历史可回放，核心输入待核')
             if title in ('weak-complete','ambiguous-short'):
                 if title=='weak-complete':
                     (job/'account_evidence.json').unlink()
                 return dict(status='evidence_missing',reason='成分时间尚待核实，但长账本已完成')
-            if title=='invalid-full':
-                return dict(status='invalid_replay',reason='样例复盘确认使用未来数据')
+            if title in ('invalid-full','late-evidence-error'):
+                fills = pd.read_csv(job/'fills.csv')
+                fills['signal_date'] = '2026-11-20'
+                fills.to_csv(job/'fills.csv',index=False)
             if title=='changed-after-freeze':
                 protocol['strategy_version'] = 'unfrozen-change'
                 runner.save_json(job/'protocol.json',protocol)
@@ -211,9 +211,15 @@ def smoke(run_live_model):
                              {kind:['evidence.md'] for kind in
                               ('signal_timing','execution_and_cost','ledger_reconciliation')})
             draft = job/('evidence_draft.json' if title in ('promoted','late-evidence-error') else 'submission_draft.json')
-            runner.save_json(draft,dict(strategy_id='fixture-ready',
-                strategy_version=f'fixture-{title}',strategy_type='stock',run_role='OFFICIAL_MAIN',
-                cost_scenario='NORMAL',**manifest))
+            if title=='v1-fail':
+                evidence = runner.read_json(job/'submission_evidence.json')
+                runner.save_json(job/'submission_evidence.json',dict(**evidence,v1_readiness=dict(
+                    strategy_type='stock',ledger_sha256=runner.digest(job/'ledger.csv'),
+                    blockers=[],observations=['日线撮合，缺历史竞价队列'])))
+            else:
+                runner.save_json(draft,dict(strategy_id='fixture-ready',
+                    strategy_version=f'fixture-{title}',strategy_type='stock',run_role='OFFICIAL_MAIN',
+                    cost_scenario='NORMAL',**manifest))
             runner.save_json(job/'strategy_branches.json',{'branches':[
                 dict(branch_id='main',name='fixture',source_pages=[1],role='strategy',
                      disposition='selected',reason='primary'),
@@ -274,17 +280,15 @@ def smoke(run_live_model):
                                                      'changed-implementation','impossible-turnover',
                                                      'unverified-rules','premature-rules','late-evidence-error']
                 assert [r['status'] for r in result]==['rules_missing','audit_uncertain','audit_uncertain','audit_hold',
-                                                      'evidence_missing','passed','history_short','v1_pending_evidence',
+                                                      'evidence_missing','passed','history_short','audit_hold',
                                                       'v1_fail','evidence_missing','run_failed','history_short',
-                                                      'v1_pending_evidence','passed','evidence_missing','invalid_replay',
-                                                      'v1_diagnostic_fail','data_pending','evidence_missing',
+                                                      'v1_fail_review','passed','evidence_missing','invalid_replay',
+                                                      'v1_fail_review','data_pending','evidence_missing',
                                                       'invalid_replay','evidence_missing','invalid_replay',
                                                       'rules_pending','v1_fail','invalid_replay'], [
                     (r['title'],r['status'],r['detail'][:120]) for r in result]
                 for row in result:
                     phases = ['research']
-                    if row['title'] in ('long-diagnostic','promoted','late-evidence-error'):
-                        phases.append('evidence_review')
                     if row['title']=='ambiguous-short':
                         phases.append('coverage_review')
                     if row['title']=='throttled':
@@ -297,20 +301,28 @@ def smoke(run_live_model):
                 assert not (jobs/short['sha']/'v1_diagnostic.json').exists()
                 assert not (jobs/result[4]['sha']/'v1_diagnostic.json').exists()
                 diagnostic = jobs/result[7]['sha']
-                assert (diagnostic/'ledger.csv').is_file() and not (diagnostic/'v1_result.json').exists()
-                assert not (diagnostic/'official_submission.json').exists() and result[7]['v1'] is None
-                diagnosis = runner.read_json(diagnostic/'v1_diagnostic.json')
-                assert diagnosis['run_role']=='DIAGNOSTIC_ONLY' and diagnosis['screening_status']=='PASS'
+                assert (diagnostic/'ledger.csv').is_file() and not (diagnostic/'v1_diagnostic.json').exists()
+                assert (diagnostic/'official_submission.json').is_file() and result[7]['v1']=='PASS'
+                diagnosis = runner.read_json(diagnostic/'v1_result.json')
+                assert '历史成员版本未知' in result[7]['detail']
+                assert diagnosis['run_role']=='OFFICIAL_MAIN' and diagnosis['screening_status']=='PASS'
+                assert diagnosis['evidence_status']=='pending' and 'account_sha256' not in diagnosis['inputs']
                 assert Path(diagnosis['source'])==(diagnostic/'ledger.csv').resolve()
                 assert diagnosis['inputs']['ledger_sha256']==runner.digest(diagnostic/'ledger.csv')
-                assert result[7]['mail']=='not_required' and not (diagnostic/'audit.md').exists()
+                assert result[7]['mail']=='SMTP_ACCEPTED' and (diagnostic/'audit.md').is_file()
+                assert 'account_evidence.json' in (diagnostic/'audit_packet.txt').read_text(encoding='utf-8')
                 failed = jobs/result[8]['sha']
                 assert result[8]['v1']=='FAIL' and result[8]['candidate']=='fixture-reconstructed'
                 assert result[13]['v1']=='PASS' and result[13]['candidate']=='fixture-reconstructed'
                 assert runner.read_json(failed/'official_submission.json')['strategy_id']=='fixture-reconstructed'
+                assert not (failed/'submission_draft.json').exists()
+                assert not (failed/'v1_diagnostic.json').exists()
+                assert runner.read_json(failed/'v1_result.json')['inputs']['quality_sha256']==runner.digest(
+                    failed/'v1_quality.json')
                 assert not (jobs/result[10]['sha']/'official_submission.json').exists()
                 assert '缺少明确的代理验收' in result[11]['detail'] and not (jobs/result[11]['sha']/'ledger.csv').exists()
-                assert [event['title'] for event in journal if event['audit']]==['audit-timeout','audit-invalid','audit-hold','ready','promoted']
+                assert [event['title'] for event in journal if event['audit']]==[
+                    'audit-timeout','audit-invalid','audit-hold','ready','long-diagnostic','promoted']
                 assert result[3]['mail']=='SMTP_ACCEPTED' and result[4]['v1'] is None
                 for row in result[1:3]:
                     unresolved = jobs/row['sha']
@@ -327,7 +339,7 @@ def smoke(run_live_model):
                 assert scored['start']=='2019-01-01' and scored['years']>7
                 assert runner.relay(record(db,job,passed),scored,runner.read_json(job/'protocol.json'),
                                     job,'可进入模拟观察，人工安排')=='SMTP_ACCEPTED'
-                assert sends==['b@example.invalid']*5
+                assert sends==['b@example.invalid']*6
                 ready_events = [event for event in journal if event['title']=='ready']
                 assert [(event['phase'],event['model'],event['audit']) for event in ready_events] == [
                     ('research',runner.RESEARCH_MODEL,False), ('audit',runner.AUDIT_MODEL,True),
@@ -335,14 +347,15 @@ def smoke(run_live_model):
                 assert passed['archived'] and Path(passed['archived']).is_file()
                 runner.scan(db)
                 assert db.execute('select count(*) from queue').fetchone()[0]==25
-                assert (jobs/result[12]['sha']/'v1_diagnostic.json').is_file()
-                assert runner.read_json(jobs/result[12]['sha']/'v1_diagnostic.json')['start']=='2018-12-31'
+                assert not (jobs/result[12]['sha']/'v1_diagnostic.json').exists()
+                assert runner.read_json(jobs/result[12]['sha']/'v1_result.json')['start']=='2018-12-31'
+                assert result[12]['v1']=='FAIL' and result[16]['v1']=='FAIL'
                 assert runner.read_json(failed/'v1_result.json')['start']=='2018-12-31'
-                assert (jobs/result[16]['sha']/'v1_diagnostic.json').is_file()
+                assert (jobs/result[16]['sha']/'v1_result.json').is_file()
                 for row in [*result[14:16],*result[17:-1]]:
                     assert not (jobs/row['sha']/'v1_diagnostic.json').exists()
                 actual_error = jobs/result[-1]['sha']
-                assert (actual_error/'v1_diagnostic.json').is_file() and not (actual_error/'v1_result.json').exists()
+                assert not (actual_error/'v1_diagnostic.json').exists() and not (actual_error/'v1_result.json').exists()
                 bad=dict(scored,start='1970-01-01',cagr=float('inf'))
                 try:
                     runner.validate_benchmark_result(bad,scored['start'],pd.Timestamp(scored['end']))
@@ -431,7 +444,7 @@ def smoke(run_live_model):
                 with patch.object(runner,'research_result',return_value=(dict(status='official',reason='旧账本待核'),True)):
                     runner.process(db,result[8])
                 pending = db.execute('select status,detail from queue where sha=?',(result[8]['sha'],)).fetchone()
-                assert pending['status']=='v1_pending_evidence' and '参考分 FAIL' in pending['detail']
+                assert pending['status']=='evidence_missing' and 'account_evidence.json' in pending['detail']
                 ledger = pd.read_csv(job/'ledger.csv')
                 ledger.loc[len(ledger)-1,'equity'] = 650000
                 ledger.to_csv(job/'ledger.csv',index=False)
@@ -489,7 +502,7 @@ def smoke(run_live_model):
                           audit_large_table_summary=True, audit_rejects_unsubstantiated_pass=True,
                           simulation_ignores_optional_numbers=True, past_lookback_not_called_future_label=True,
                           confirmed_reuse_and_forward_label_block=True, foreign_calendar_not_substituted=True,
-                          diagnostic_v1_pass_does_not_trigger_audit_or_mail=True,
+                          incomplete_evidence_pass_enters_audit_but_cannot_be_approved=True,
                           rejected_proxy_does_not_fill_diagnostic_history=True),
                          ensure_ascii=False),flush=True)
         if run_live_model:
@@ -508,14 +521,16 @@ def smoke(run_live_model):
             print(f'真实新审计会话已验证：{dispatch["model"]}/{dispatch["effort"]}，22 项返回，无命令调用。',flush=True)
 
 
-def parallel_smoke():
+def parallel_smoke(candidate_count=None):
     with tempfile.TemporaryDirectory(prefix='pipeline-parallel-') as folder:
         base = Path(folder)
         inbox, jobs, summary = [base/x for x in ('inbox','jobs','summary')]
         for directory in (inbox,jobs,summary):
             directory.mkdir()
         settings = dict(INBOX=inbox,JOBS=jobs,SUMMARY=summary,RUNTIME=base,STATE=base/'queue.sqlite3')
-        workers = runner.DEFAULT_WORKERS
+        limit = runner.DEFAULT_WORKERS
+        total = candidate_count if candidate_count is not None else limit+2
+        workers = min(limit,total)
         first_wave = Barrier(workers,timeout=10)
         lock = Lock()
         seen = []
@@ -538,7 +553,7 @@ def parallel_smoke():
             with lock:
                 in_flight -= 1
 
-        for index in range(workers+2):
+        for index in range(total):
             source = inbox/f'{index}.pdf'
             source.write_bytes(b'%PDF-1.4\n'+bytes([65+index])*200+b'\n%%EOF')
             os.utime(source,(1_700_000_000+index,)*2)
@@ -547,8 +562,8 @@ def parallel_smoke():
              patch.object(runner,'process',side_effect=process):
             runner.run(watch=False,priority_sha=priority)
             with closing(runner.open_queue()) as db:
-                assert dict(db.execute('select status,count(*) from queue group by status'))=={'diagnostic':workers+2}
-        assert peak==workers and len(seen)==workers+2 and in_flight==0 and priority in seen[:workers]
+                assert dict(db.execute('select status,count(*) from queue group by status'))=={'diagnostic':total}
+        assert peak==workers and len(seen)==total and in_flight==0 and priority in seen[:workers]
         print(f'并行验证通过：峰值 {workers} 篇，优先研报进入首批，每篇各派发一次。',flush=True)
 
 
@@ -627,8 +642,31 @@ def resume_smoke():
 
 
 def closing_guards_smoke():
+    from account_checks import check_charges
+
     with tempfile.TemporaryDirectory(prefix='pipeline-closing-guards-') as folder:
         root = Path(folder)
+        fees = root/'historical_transfer.csv'
+        fees.write_text(
+            'symbol,side,start,end,commission_rate,min_commission,tax_rate,other_rate,slippage_rate,other_per_share,minimum_other\n'
+            'fixture.SH,buy,2010-01-01,2015-07-31,0.0003,5,0,0,0,0.0003,1\n'
+            'fixture.SH,buy,2015-08-01,2026-12-31,0.0003,5,0,0.00002,0,0,0\n',
+            encoding='utf-8')
+        charges = ('commission','tax','other_fee','slippage')
+        fills = pd.DataFrame([
+            dict(date=day,symbol='fixture.SH',quantity=quantity,price=10,commission=commission,
+                 tax=0,other_fee=other,slippage=0)
+            for day,quantity,commission,other in (('2014-01-02',1000,5,1),
+                                                  ('2014-01-03',4000,12,1.2),
+                                                  ('2016-01-04',1000,5,.2))])
+        check_charges(fills,fees,charges)
+        fills.loc[0,'other_fee'] = 0.3
+        try:
+            check_charges(fills,fees,charges)
+        except runner.AccountMismatch:
+            pass
+        else:
+            raise AssertionError('历史最低过户费没有核对')
         job = root/'case'
         job.mkdir()
         days = pd.bdate_range('2020-01-02',periods=6)
@@ -735,9 +773,127 @@ def closing_guards_smoke():
     print('收尾验证通过：持仓缺价和错误权益被挡，正常停牌及合法两笔分红通过，封存依赖进入审计，终态邮件独立恢复。',flush=True)
 
 
+def correction_smoke():
+    from v1_handoff import register_correction, select_scoring_book
+
+    with tempfile.TemporaryDirectory(prefix='pipeline-corrected-v1-') as folder:
+        root = Path(folder).resolve()
+        job = root/'original'
+        child = job/'corrected'
+        child.mkdir(parents=True)
+        days = [d.date() for d in pd.bdate_range('2019-01-02','2026-11-20')]
+        dates = [d.isoformat() for d in days]
+        plan = dict(planned_start=dates[0],planned_end=dates[-1],calendar_path='calendar.json',
+                    ledger_path='ledger.csv',date_column='date',equity_column='equity',
+                    proxy_used=False,initial_capital=1e6,cost_profile='fixture')
+        protocol = dict(strategy_id='fixture-ready',strategy_version='corrected-fixture',source_kind='original',
+                        source_pages=[1],screening_scope='diagnostic',v1_preflight=plan)
+        protocol['rule_contract'] = {key:dict(kind='assumption',rule=key,basis='fixture')
+                                     for key in ('universe','signal','rebalance','allocation','execution',
+                                                 'data_availability')}
+        for book, rate in ((job,1.0006),(child,0.999)):
+            (book/'source.pdf').write_bytes(b'fixture original paper')
+            runner.atomic_text(book/'source.txt','fixture source')
+            runner.save_json(book/'calendar.json',dates)
+            runner.save_json(book/'protocol.json',protocol)
+            seal_research(book,'fixture-ready',require_calendar=True)
+            values = [1e6 * rate**i for i in range(len(days))]
+            write_account_fixture(book,days,values,0)
+            pd.DataFrame(dict(date=dates,equity=values,cash=0,receivable=0)).to_csv(book/'ledger.csv',index=False)
+        runner.save_json(root/'market_calendar.json',dict(source=SOURCE,start=dates[0],end=dates[-1],sessions=dates))
+        register_correction(job,'fixture-ready','corrected/ledger.csv')
+        book,revision = select_scoring_book(job,protocol)
+        assert book==child and revision==job/'v1_ledger_revision.json'
+        with patch.object(runner,'RUNTIME',root):
+            ledger,_,_ = runner.full_research_ledger(book,protocol)
+            manifest = runner.prepare_v1(job,book,protocol,ledger,'fixture-ready',revision)
+            runner.save_json(job/'official_submission.json',manifest)
+            score = runner.evaluate_verified(job,job/'official_submission.json',job/'v1_result.json')
+        assert score['screening_status']=='FAIL' and score['evidence_status']=='pending'
+        assert score['inputs']['ledger_sha256']==runner.digest(child/'ledger.csv')
+        runner.assert_scored_book(job,job/'official_submission.json',ledger,score)
+        with (child/'ledger.csv').open('a',encoding='utf-8') as stream:
+            stream.write('\n')
+        try:
+            select_scoring_book(job,protocol)
+        except ValueError as exc:
+            assert '指纹' in str(exc)
+        else:
+            raise AssertionError('坏修正版不得回退到旧账本')
+    print('修正版校验通过：V1 只采用登记的封存账本，指纹异常无旧版回退。',flush=True)
+
+
+def token_saving_smoke():
+    import sys
+
+    import research_tools
+    import tushare_probe
+
+    with tempfile.TemporaryDirectory(prefix='pipeline-tool-output-') as folder:
+        root = Path(folder).resolve()
+        run = research_tools.run_logged(
+            [sys.executable,'-c','print("x"*120000);raise SystemExit(7)'],Path('run.log'),root)
+        assert run['exit_code']==7 and run['truncated'] and len(run['tail'])<=1600
+        assert len((root/'run.log').read_text().strip())==120000
+        (root/'sample.txt').touch()
+        page = research_tools.list_files(root,'*',1,1)
+        assert page['total']==2 and page['files']==['sample.txt']
+
+        request = tushare_probe.request_spec('report_rc',{'report_date':'20191230'},'ts_code,np')
+        jobs = [root/'first',root/'second']
+        for job in jobs:
+            job.mkdir()
+            runner.save_json(job/'probe.json',dict(provider='Tushare',status='rate_limited',request=request))
+            runner.save_json(job/'history_coverage.json',dict(files=['probe.json'],observations=[
+                dict(source='Tushare report_rc',status='rate_limited',file='probe.json')]))
+            runner.save_json(job/'data_retry_request.json',dict(reason='历史预测取数限频'))
+
+        calls = []
+        def probe_transport(command, **_kwargs):
+            job,*arguments = command
+            value = lambda flag: arguments[arguments.index(flag)+1]
+            fields = next(a.split('=',1)[1] for a in arguments if a.startswith('--fields='))
+            original = tushare_probe.request_spec(value('--api'),json.loads(value('--params')),fields)
+            assert original==request
+            calls.append(job)
+            if len(calls)==1:
+                fetch = patch.object(tushare_probe,'fetch_request',side_effect=RuntimeError('HTTP 429'))
+            else:
+                fetch = patch.object(tushare_probe,'fetch_request',
+                                     return_value=pd.DataFrame([dict(ts_code='600519.SH',np=10)]))
+            with fetch:
+                tushare_probe.run_probe(job,Path(value('--receipt')),original)
+
+        now = runner.time.time()
+        origin = dict(id='fixture-retry')
+        candidate = dict(title='回合用量测试')
+        with patch.object(runner,'RUNTIME',root), patch.object(runner,'wsl_command',side_effect=lambda job,*args:(job,*args)), \
+             patch.object(runner.subprocess,'run',side_effect=probe_transport), \
+             patch.object(runner,'refresh_calendar',return_value=root/'calendar.json'), \
+             patch.object(runner,'summarize'), patch.object(runner,'model_run') as model:
+            first,_ = runner.research_result(None,candidate,jobs[0],origin)
+            second,_ = runner.research_result(None,candidate,jobs[1],origin)
+            assert first['status']==second['status']=='data_pending' and first['retry_at']==second['retry_at']
+            assert calls==jobs[:1] and not model.called
+            assert tushare_probe.retry_time(dict(status='rate_limited',retry_after='42'),now,900)==now+42
+            runner.save_json(jobs[1]/'probe.json',dict(source='Tushare report_rc',status='rate_limited',
+                                                       params=request['params']))
+            assert tushare_probe.pending_request(jobs[1]) is None
+            model.return_value = dict(status='evidence_missing',reason='已读到自动重试产物')
+            with patch.object(runner.time,'time',return_value=now+runner.DATA_RETRY_DELAY+60):
+                recovered,_ = runner.research_result(None,candidate,jobs[0],origin)
+                runner.research_result(None,candidate,jobs[0],origin)
+            assert recovered['status']=='evidence_missing' and len(calls)==2
+            assert all('程序已用原参数取回 1 行数据' in invocation.args[2] for invocation in model.call_args_list)
+    print('用量优化验证通过：全量日志落盘，限流共用退避，取数恢复沿原会话，复用已核验回包。',flush=True)
+
+
 if __name__=='__main__':
     import sys
     smoke('--live-audit' in sys.argv)
     parallel_smoke()
+    parallel_smoke(candidate_count=3)
     resume_smoke()
     closing_guards_smoke()
+    correction_smoke()
+    token_saving_smoke()

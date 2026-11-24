@@ -154,10 +154,19 @@ def agrees(left,right,tolerance=0.011):
 def check_charges(fills, path, money):
     rates = ('commission_rate','min_commission','tax_rate','other_rate','slippage_rate')
     schedule = table(path,('symbol','side','start','end',*rates),rates)
+    # Some older markets charged the transfer component per share or by face value.
+    extra = ('other_per_share','minimum_other')
+    for field in extra:
+        if field not in schedule:
+            schedule[field] = 0.0
+        else:
+            schedule[field] = pd.to_numeric(schedule[field],errors='raise')
+            if not schedule[field].map(math.isfinite).all():
+                raise ValueError(f'冻结费率表含无效的 {field}')
     for name in ('start','end'):
         schedule[name] = pd.to_datetime(schedule[name].astype(str),format='mixed').dt.strftime('%Y-%m-%d')
     if (schedule[['start','end']].isna().any().any() or (schedule['start']>schedule['end']).any()
-            or (schedule[list(rates)]<0).any().any() or not schedule['side'].isin(('buy','sell')).all()):
+            or (schedule[list(rates+extra)]<0).any().any() or not schedule['side'].isin(('buy','sell')).all()):
         raise ValueError('冻结费率表的生效区间、方向或费率无效')
     by_symbol = {symbol:list(group.itertuples(index=False)) for symbol,group in schedule.groupby('symbol')}
     for fill in fills.itertuples(index=False):
@@ -169,9 +178,11 @@ def check_charges(fills, path, money):
         if len(rules)!=1:
             raise ValueError(f'{fill.date} {fill.symbol} 没有唯一事前费用规则')
         rate = rules[0]
-        amount = abs(fill.quantity)*fill.price
+        quantity = abs(fill.quantity)
+        amount = quantity*fill.price
+        other = max(rate.minimum_other,amount*rate.other_rate+quantity*rate.other_per_share)
         expected = (max(rate.min_commission,amount*rate.commission_rate),amount*rate.tax_rate,
-                    amount*rate.other_rate,amount*rate.slippage_rate)
+                    other,amount*rate.slippage_rate)
         if not all(agrees(getattr(fill,key),value) for key,value in zip(money,expected)):
             raise AccountMismatch(f'{fill.date} {fill.symbol} 实际扣费与冻结费率不一致')
 

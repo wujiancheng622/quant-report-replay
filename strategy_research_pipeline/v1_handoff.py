@@ -330,15 +330,76 @@ def seal_replay(job, source_id):
     return values
 
 
+def corrected_replay(job, protocol, relative_ledger, ledger_hash):
+    ledger = inside(job, relative_ledger)
+    book = ledger.parent
+    if book == job.resolve() or not book.is_relative_to(job.resolve()):
+        raise ValueError('修正版必须放在原研究目录下的独立子目录')
+    revised = check_research_freeze(book,protocol['strategy_id'])
+    if revised != protocol or ledger.name != revised['v1_preflight']['ledger_path']:
+        raise ValueError('修正回放与原冻结的规则、成本、区间或账本定义不一致')
+    if digest(inside(book,'source.pdf')) != digest(inside(job,'source.pdf')):
+        raise ValueError('修正回放的原文与主任务不一致')
+    check_replay_seal(book,revised)
+    if digest(ledger) != ledger_hash:
+        raise ValueError('修正版账本与交接指纹不一致')
+    return book
+
+
+def select_scoring_book(job, protocol):
+    selected = job/'v1_ledger_revision.json'
+    if selected.is_file():
+        data = read_json(selected)
+        return corrected_replay(job,protocol,data['ledger_path'],data['ledger_sha256']), selected
+    receipts = [p for p in (job/'compatible_replay_receipt.json',job/'compatible_replay_pointer.json') if p.is_file()]
+    if len(receipts)>1:
+        raise ValueError('发现多份旧修正回执，请明确登记唯一评分账本')
+    if not receipts:
+        return job,None
+    receipt = receipts[0]
+    data = read_json(receipt)
+    if 'compatible_directory' in data:
+        name = protocol['v1_preflight']['ledger_path']
+        ledger = (Path(data['compatible_directory'])/name).as_posix()
+        fingerprint = data['root_files'][name]
+        if digest(inside(job,name)) != fingerprint:
+            raise ValueError('旧兼容核账回执与原账本指纹不一致')
+    elif 'compatible_verified_ledger' in data:
+        ledger,fingerprint = data['compatible_verified_ledger'],data['compatible_ledger_sha256']
+    else:
+        ledger,fingerprint = data['ledger_path'],data['ledger_sha256']
+    return corrected_replay(job,protocol,ledger,fingerprint),receipt
+
+
+def register_correction(job, source_id, relative_ledger):
+    protocol = check_research_freeze(job,source_id)
+    ledger = inside(job,relative_ledger)
+    receipt = dict(ledger_path=ledger.relative_to(job.resolve()).as_posix(),ledger_sha256=digest(ledger))
+    corrected_replay(job,protocol,receipt['ledger_path'],receipt['ledger_sha256'])
+    path = job/'v1_ledger_revision.json'
+    if (job/'v1_result.json').exists() or (job/'official_submission.json').exists():
+        if not path.is_file() or read_json(path) != receipt:
+            raise ValueError('已经生成评分交接，须另开复验保留本轮记录')
+    else:
+        save_json(path,receipt)
+    return receipt
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='在同一研究会话中核验并冻结回测协议')
     parser.add_argument('--source-id', required=True)
     parser.add_argument('--require-calendar', action='store_true')
-    parser.add_argument('--seal-replay', action='store_true')
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument('--seal-replay', action='store_true')
+    modes.add_argument('--select-correction', metavar='LEDGER')
     args = parser.parse_args()
     try:
-        result = (seal_replay(Path.cwd(),args.source_id) if args.seal_replay
-                  else seal_research(Path.cwd(),args.source_id,args.require_calendar))
+        if args.select_correction:
+            result = register_correction(Path.cwd(),args.source_id,args.select_correction)
+        elif args.seal_replay:
+            result = seal_replay(Path.cwd(),args.source_id)
+        else:
+            result = seal_research(Path.cwd(),args.source_id,args.require_calendar)
         print(json.dumps(result))
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
         parser.exit(1, f'冻结未完成：{exc}\n')

@@ -58,8 +58,8 @@ missing 写明具体无法定义的规则，source_pages 是对应原文页码�
 冻结前允许计算规则与微样本核验，不读取本次主区间策略收益。准备好唯一 protocol.json 后，立刻在同一会话执行
 下方给出的冻结命令。命令报错时先按原因修正证据或合同，成功后继续实际运行；不写或改 freeze_receipt.json。
 协议包含 strategy_id（下方原文 ID）、strategy_version、source_kind（original 或 reconstruction）、source_pages、
-信号与交易、成本、样本及证据。screening_scope 记录事前预期（official 或 diagnostic）。后续是否正式送检由后台
-按冻结账本、独立核账和完整证据判定。v1_preflight 对象必须预先写 planned_start、planned_end（实际账本首末日 ISO 日期）、
+信号与交易、成本、样本及证据。screening_scope 仅记录事前预期（official 或 diagnostic）。后台用账本长度、日历、
+冻结指纹和可证实的错账决定是否评分。v1_preflight 对象必须预先写 planned_start、planned_end（实际账本首末日 ISO 日期）、
 proxy_used（资产或信号代理布尔值）、ledger_path（工作目录下尚未生成的唯一主账本文件名，CSV/Parquet/JSONL）、
 date_column、equity_column、initial_capital、cost_profile（唯一 NORMAL 成本的说明）以及 calendar_path。
 写 ledger_market（CN、US 或 OTHER，指实际交易市场）和 currency（结算币种）。持有境内上市 ETF 即使使用海外
@@ -77,15 +77,22 @@ basis（日期和验收依据）、files（真实核验文件的相对路径数�
 冻结成功后继续写代码和准备原始数据。主回测前写 replay_inputs.json，含 entrypoint（运行脚本相对路径）
 和 files（回测入口、它使用的模块及实际输入快照的相对路径数组）。执行下方锁定回放命令，再跑全长账本。
 发现实现错误要先保留原证据，按冻结规则重建兼容输入或由台账重开复验，不覆盖已有锁定文件或按收益改方案。
+修正版放在子目录并自行检查完整冻结、封存及核账。在原研究目录调用同一个 v1_handoff.py，
+带 --source-id <原文 ID> --select-correction <相对修正版账本路径> 参数登记唯一评分版本。
 核查信号和成交时点、现金与实际持仓、成本及日历覆盖。保存结论、逐日净值与
 交易证据到当前目录。replay.md 记录已执行区间、账务和执行核验、可复核限制及任何未闭合的原因。
 只在长账本实际完成且证据仍有局限时返回 diagnostic。若后续实查证实有效历史不足，直接停止并返回 history_short。
-复查上游证据足以正式评分时，写 submission_draft.json，遵守项目 V1 单一 OFFICIAL_MAIN/NORMAL 清单；
-其 strategy_id 先填原文 ID、strategy_version 与冻结协议一致，ledger_path、日期列、净值列、本金、成本、代理
-与冻结协议一致，日期使用普通列。调度器将登记重建版 ID 并调用评分器。不要直接调用 V1，不写 official_submission.json。
-正式送检一并写 submission_evidence.json。signal_timing、execution_and_cost、ledger_reconciliation 三项
-各列支持该结论的非空证据文件相对路径数组，对应信号在成交前已知、成交与成本、现金和持仓净值逐日核对。
-正式送检还需 account_evidence.json 导向独立核账表。字段为 quotes、fills、positions、events、fee_schedule
+凡完成冻结长账本，均尽可能交齐标准核验材料，属于重建版或有普通观察项也一样。不要因成绩或研究回执的
+official/diagnostic 标签省略交接。后台以同一冻结账本及核账结果登记唯一 OFFICIAL_MAIN/NORMAL，不直接调用 V1。
+写 submission_evidence.json。signal_timing、execution_and_cost、ledger_reconciliation 各列实际证据文件相对路径。
+v1_readiness 对象含 ledger_sha256、blockers 数组、observations 数组。
+数值健全和账册一致由代码核验。blockers 只记录供后续复核的关键事实，每项有 code、detail、files。
+code 只能是 signal_timing（时间问题）、portfolio_inputs（核心输入或标的资格会改变信号、持仓或权重）、
+execution（无法支持实际模拟的下单时点、成交价格或数量）、accounting（影响现金、持仓、费用、权益或净值）。
+detail 写明所涉日期、标的或受影响的机制，files 引用落盘证据。可证实的错误返回 invalid_replay。
+已有事前委托限制、可核价格和日线成交量、停牌与资金约束时，未保存竞价队列、完整逐笔深度等列入 observations。
+有依据且事前冻结的本地补法和风险、稳健性等一般观察项也写入 observations，不能作为独立的送检否决理由。
+写 account_evidence.json 导向独立核账表。字段为 quotes、fills、positions、events、fee_schedule
 （研究目录相对路径，CSV 或 Parquet），cash_column、receivable_column（默认 cash、receivable）。
 quotes 表 date,symbol,open,high,low,close,volume,upper,lower,suspended,buy_min,buy_step,t_plus。
 原始价格和成交量使用元与股或基金份，涨跌停、停牌和申报数量、结算按证券当日真实规则列出。
@@ -97,10 +104,12 @@ events 表 date,symbol,seq,kind,source,cash_delta,receivable_delta,quantity，�
 每日 qty、现金和应收按 seq 顺序记账，seq 同一天不得重复。kind 取 distribution、settlement、share_change、tax、
 liquidation，source 指向事前锁定的原始依据。现金、应收、估值和股数均由后台重算。完整字段见 account_checks.py。
 fee_schedule 表 symbol,side,start,end,commission_rate,min_commission,tax_rate,other_rate,slippage_rate。
+历史过户费若以股数或实际面值计，按当期原规则折算为每股金额并封存到 other_per_share，可用 minimum_other 表示最低额。
+两列缺省均为零，不得从既有成交账倒推费率。成交额和每股费用按冻结规则计算，对应底稿和来源保留。
 symbol 可用 * 表示默认规则，存在当日标的专用规则时优先。费率用小数，按实际冻结的正常成本记录。
 quotes、fee_schedule 和权益原始依据要列入事前锁定的 replay_inputs.json。无法映射到该账本合同的执行模型，
-保留完整长账本给 V1 算参考分，写清机构交易假设的适用边界。
-仅返回 official 时写 audit_inputs.json。数组列出 1–24 个研究目录内的必要原始输入或核验文件，至少一份 Python 代码。
+保留完整长账本给 V1 评分，写清无法核账的字段及执行假设的适用边界。
+具备送检条件时写 audit_inputs.json。数组列出 1–24 个研究目录内的必要原始输入或核验文件，至少一份 Python 代码。
 在冻结回放前把关键特征及权重输入的生成脚本、未出现在静态导入链中的本地模块列入 replay_inputs.json 的 files
 和 audit_required。正式账务的 account_evidence.json 中 cash_actions 指向已在回放前封存的现金权益 JSON。
 该 JSON 的 coverage 按实际持仓标的记录 symbol、start、end、source，source 指向已封存且能证明连续现金权益
@@ -116,16 +125,14 @@ quotes、fee_schedule 和权益原始依据要列入事前锁定的 replay_input
 、source_pending、data_pending、invalid_replay 或 scope_excluded。写完产物再结束本回合。
 """
 
-EVIDENCE_REVIEW = """
-接续这篇研报的同一研究会话。调度器已用 V1 数值诊断确认冻结长账本达到收益与回撤门槛。
-只补影响正式送检的具体证据。先读 evidence.md 和 replay.md 中的缺口，查相关原始数据、发行人或交易所公告、
-换仓日、持仓事件、公开生效时点及事前成交约定。对可以用已知范围证明不改变关键结果的小缺口，写下量化依据。
-不要改协议、已冻结口径、主净值、代理、样本或成本；不另跑策略、试换参数或挑收益。若查实需要改回放的错误，
-说明错误的位置和影响并返回 invalid_replay。证据仍不齐时返回 evidence_missing，并写清缺的是哪项。
-把本轮查过的来源、结果、剩余影响写到 evidence_review.md。只有同一冻结账本所需证据已经闭合，
-才按前一回合合同写 submission_draft.json、submission_evidence.json 和 audit_inputs.json，并返回 official。
-只输出 status 和 reason。
+RESEARCH_TOOL_GUIDE = """
+查目录使用 {tools} files <目录>，查已知进程使用 {tools} process <PID>。
+耗时命令用 {tools} run --log logs/<唯一文件名> -- <命令及参数>，完整输出落盘，回显只给状态和尾部。后台命令用执行会话等待结果；
+查看原文、公式、报错或数据异常时，按页码、行或字段读取相关原始内容。
+点查 Tushare 用 {probe} --api <接口> --params '<原始 JSON 参数>' --fields '<请求字段，默认传空字符串>' --receipt <新回执.json>。
+临时取数错误在 history_coverage.json 的 observations 里引用该回执，记录对应字段与实际状态。后台可按回执重放，恢复时优先使用已保存的结果。
 """
+
 
 RESEARCH_RESUME = """
 接续同一策略的研究会话。先读落盘的 evidence.md、history_coverage.json 和已冻结协议（如存在），
@@ -139,6 +146,7 @@ RESEARCH_RESUME = """
 AUDIT = """
 你是独立量化审计员。依据明确提供的证据包工作，工具和记忆已关闭。
 先按原文与冻结协议检查规则和数据时点，再检查实现和账本；复现者的评价、V1 结果均未交接。
+证据状态文件中的缺口是待复核事实。结合原始资料核对其影响；缺证不等于已证实违规。
 大表可能以全表计算的统计、时点核验和有行号的样例交接。只能用统计直接支持其覆盖的判断，
 缺少必要明细时标记未查，不能从抽样推定未展示行没有问题。
 逐条核对全部 22 项并记录证据；已经发现硬伤也继续检查其他条款。确实缺材料或不能判断的
